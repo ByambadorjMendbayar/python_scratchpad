@@ -8,12 +8,27 @@ import polars as pl
 
 
 DATABRICKS_TO_SYNAPSE_TYPE_MAP = {
-    "TINYINT": "TINYINT", "SMALLINT": "SMALLINT", "INT": "INT", "INTEGER": "INT",
-    "BIGINT": "BIGINT", "FLOAT": "REAL", "REAL": "REAL", "DOUBLE": "FLOAT",
-    "DECIMAL": "DECIMAL", "NUMERIC": "NUMERIC", "STRING": "VARCHAR",
-    "VARCHAR": "VARCHAR", "CHAR": "CHAR", "BINARY": "VARBINARY",
-    "DATE": "DATE", "TIMESTAMP": "DATETIME2", "TIMESTAMP_NTZ": "DATETIME2",
-    "TIMESTAMP_LTZ": "DATETIMEOFFSET", "BOOLEAN": "BIT",
+    "TINYINT": ("TINYINT", "SMALLINT", "INT"),
+    "SMALLINT": ("SMALLINT", "INT"),
+    "SHORT": ("SMALLINT", "INT"),
+    "INT": ("INT", "SMALLINT"),
+    "INTEGER": ("INT", "SMALLINT"),
+    "BIGINT": "BIGINT",
+    "FLOAT": ("REAL", "FLOAT"),
+    "REAL": ("REAL", "FLOAT"),
+    "DOUBLE": ("FLOAT", "REAL"),
+    "DECIMAL": ("DECIMAL", "NUMERIC"),
+    "NUMERIC": ("NUMERIC", "DECIMAL"),
+    "STRING": ("VARCHAR", "NVARCHAR", "VARBINARY"),
+    "VARCHAR": ("VARCHAR", "NVARCHAR"),
+    "CHAR": ("CHAR", "NCHAR"),
+    "BINARY": ("VARBINARY", "BINARY"),
+    "VARBINARY": ("VARBINARY", "BINARY"),
+    "DATE": "DATE",
+    "TIMESTAMP": ("DATETIME2", "DATETIME"),
+    "TIMESTAMP_NTZ": ("DATETIME2", "DATETIME"),
+    "TIMESTAMP_LTZ": ("DATETIMEOFFSET", "DATETIME2"),
+    "BOOLEAN": ("BIT", "BOOLEAN"),
 }
 
 NUMERIC_TYPES = {"INT", "INTEGER", "BIGINT", "SMALLINT", "TINYINT", "FLOAT",
@@ -28,12 +43,37 @@ def base_type(dtype: str) -> str:
     return str(dtype).split("(")[0].strip().upper() if dtype is not None else None
 
 
+def _map_dbx_to_synapse_type(dbx_type: str) -> str:
+    """Map a Databricks base type to the first matching Synapse type string."""
+    mapped = DATABRICKS_TO_SYNAPSE_TYPE_MAP.get(dbx_type)
+    if mapped is None:
+        return None
+    if isinstance(mapped, tuple):
+        return mapped[0]  # return first for display; matching checks all
+    return mapped
+
+
+def _type_matches(synapse_type: str, dbx_type: str) -> bool:
+    """Check if a Synapse type matches the expected Databricks→Synapse mapping."""
+    if synapse_type is None or dbx_type is None:
+        return False
+    mapped = DATABRICKS_TO_SYNAPSE_TYPE_MAP.get(base_type(dbx_type))
+    if mapped is None:
+        return False
+    syn_base = base_type(synapse_type)
+    if isinstance(mapped, tuple):
+        return syn_base in (base_type(m) for m in mapped)
+    return syn_base == base_type(mapped)
+
+
 def _build_synapse_stats_sql(cols: list[dict], schema: str, table: str) -> str:
     """Build a Synapse SQL query that computes per-column summary stats."""
     parts = []
     for col in cols:
-        name, btype = col["name"], col["base_type"]
-        q = f"[{name}]"
+        name = col["name"]  # normalized name (used as alias)
+        syn_name = col.get("syn_name", name)  # original Synapse column name
+        btype = col["base_type"]
+        q = f"[{syn_name}]"
         parts.append(f"SUM(CASE WHEN {q} IS NULL THEN 1 ELSE 0 END) AS [{name}__nulls]")
         parts.append(f"COUNT(DISTINCT {q}) AS [{name}__distinct]")
         if btype in NUMERIC_TYPES:
@@ -140,19 +180,34 @@ def compare_synapse_vs_databricks(
 
     databricks_schema_df = databricks_schema_df.with_columns(
         pl.col("databricks_data_type")
-        .map_elements(lambda x: DATABRICKS_TO_SYNAPSE_TYPE_MAP.get(base_type(x)), return_dtype=pl.Utf8)
+        .map_elements(lambda x: _map_dbx_to_synapse_type(base_type(x)), return_dtype=pl.Utf8)
         .alias("synapse_expected_type")
     )
 
     # ── 2. Schema comparison ──
-    schema_comparison_df = synapse_schema_df.join(databricks_schema_df, on="column_name", how="full")
+    # Normalize Synapse column names: strip _RIO suffix for matching
+    synapse_schema_df = synapse_schema_df.with_columns(
+        pl.col("column_name")
+        .str.replace(r"_RIO$", "")
+        .alias("column_name_normalized")
+    )
+
+    schema_comparison_df = synapse_schema_df.join(
+        databricks_schema_df,
+        left_on="column_name_normalized",
+        right_on="column_name",
+        how="full",
+    ).with_columns(
+        # Use the normalized name as the canonical column name for display
+        pl.coalesce("column_name_normalized", "column_name_right").alias("matched_column"),
+    )
 
     schema_mismatches_df = schema_comparison_df.filter(
         pl.col("synapse_data_type").is_null()
         | pl.col("databricks_data_type").is_null()
-        | (
-            pl.col("synapse_data_type").map_elements(base_type, return_dtype=pl.Utf8)
-            != pl.col("synapse_expected_type").map_elements(base_type, return_dtype=pl.Utf8)
+        | ~pl.struct(["synapse_data_type", "databricks_data_type"]).map_elements(
+            lambda s: _type_matches(s["synapse_data_type"], s["databricks_data_type"]),
+            return_dtype=pl.Boolean,
         )
     )
     schema_matches = schema_mismatches_df.height == 0
@@ -173,10 +228,16 @@ def compare_synapse_vs_databricks(
     row_diff_pct = (100.0 * row_diff / synapse_row_count) if synapse_row_count else 0.0
 
     # ── 4. Per-column summary statistics (via SQL) ──
-    common_cols = sorted(
-        set(synapse_schema_df["column_name"].to_list())
-        & set(databricks_schema_df["column_name"].to_list())
-    )
+    # Use normalized names to find common columns
+    synapse_normalized = set(synapse_schema_df["column_name_normalized"].to_list())
+    databricks_col_set = set(databricks_schema_df["column_name"].to_list())
+    common_cols = sorted(synapse_normalized & databricks_col_set)
+
+    # Build a mapping from normalized name → original Synapse column name
+    syn_name_map = dict(zip(
+        synapse_schema_df["column_name_normalized"].to_list(),
+        synapse_schema_df["column_name"].to_list(),
+    ))
 
     stats_comparison_df = pl.DataFrame([])
     synapse_stats_df = pl.DataFrame([])
@@ -184,39 +245,39 @@ def compare_synapse_vs_databricks(
 
     if common_cols:
         # Build column info using Synapse types for common cols
+        # syn_name is the original Synapse column name (may have _RIO suffix)
+        # name is the normalized/Databricks column name
         col_infos = []
         for c in common_cols:
-            syn_row = synapse_schema_df.filter(pl.col("column_name") == c)
+            syn_original = syn_name_map.get(c, c)
+            syn_row = synapse_schema_df.filter(pl.col("column_name") == syn_original)
             if syn_row.height > 0:
                 btype = base_type(syn_row["synapse_data_type"][0])
             else:
                 btype = "STRING"
-            col_infos.append({"name": c, "base_type": btype})
+            col_infos.append({"name": c, "syn_name": syn_original, "base_type": btype})
 
-        # Query stats in batches to avoid Synapse "nested too deeply" error
-        BATCH_SIZE = 10
-        syn_row_merged = {}
-        dbx_row_merged = {}
+        # Sample 15 random columns if table has too many (avoids Synapse nesting limit)
+        import random
+        MAX_STATS_COLS = 15
+        if len(col_infos) > MAX_STATS_COLS:
+            col_infos_sampled = sorted(random.sample(col_infos, MAX_STATS_COLS), key=lambda x: x["name"])
+        else:
+            col_infos_sampled = col_infos
 
-        for batch_start in range(0, len(col_infos), BATCH_SIZE):
-            batch = col_infos[batch_start : batch_start + BATCH_SIZE]
+        syn_stats_sql = _build_synapse_stats_sql(col_infos_sampled, synapse_schema_name, synapse_table_name)
+        dbx_stats_sql = _build_databricks_stats_sql(
+            col_infos_sampled, databricks_catalog_name, databricks_schema_name, databricks_table_name
+        )
 
-            syn_sql = _build_synapse_stats_sql(batch, synapse_schema_name, synapse_table_name)
-            dbx_sql = _build_databricks_stats_sql(
-                batch, databricks_catalog_name, databricks_schema_name, databricks_table_name
-            )
+        syn_stats_raw = pl.read_database(syn_stats_sql, synapse_conn)
+        dbx_stats_raw = pl.read_database(dbx_stats_sql, databricks_conn)
 
-            syn_batch = pl.read_database(syn_sql, synapse_conn)
-            dbx_batch = pl.read_database(dbx_sql, databricks_conn)
-
-            if syn_batch.height > 0:
-                syn_row_merged.update(syn_batch.row(0, named=True))
-            if dbx_batch.height > 0:
-                dbx_row_merged.update(dbx_batch.row(0, named=True))
-
-        if syn_row_merged and dbx_row_merged:
-            syn_parsed = _parse_stats_row(syn_row_merged, col_infos, "synapse")
-            dbx_parsed = _parse_stats_row(dbx_row_merged, col_infos, "databricks")
+        if syn_stats_raw.height > 0 and dbx_stats_raw.height > 0:
+            syn_row_merged = syn_stats_raw.row(0, named=True)
+            dbx_row_merged = dbx_stats_raw.row(0, named=True)
+            syn_parsed = _parse_stats_row(syn_row_merged, col_infos_sampled, "synapse")
+            dbx_parsed = _parse_stats_row(dbx_row_merged, col_infos_sampled, "databricks")
 
             synapse_stats_df = pl.DataFrame(syn_parsed)
             databricks_stats_df = pl.DataFrame(dbx_parsed)
