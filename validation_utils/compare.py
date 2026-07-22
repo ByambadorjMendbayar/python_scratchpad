@@ -193,21 +193,30 @@ def compare_synapse_vs_databricks(
                 btype = "STRING"
             col_infos.append({"name": c, "base_type": btype})
 
-        # Query stats from both systems
-        syn_stats_sql = _build_synapse_stats_sql(col_infos, synapse_schema_name, synapse_table_name)
-        dbx_stats_sql = _build_databricks_stats_sql(
-            col_infos, databricks_catalog_name, databricks_schema_name, databricks_table_name
-        )
+        # Query stats in batches to avoid Synapse "nested too deeply" error
+        BATCH_SIZE = 10
+        syn_row_merged = {}
+        dbx_row_merged = {}
 
-        syn_stats_raw = pl.read_database(syn_stats_sql, synapse_conn)
-        dbx_stats_raw = pl.read_database(dbx_stats_sql, databricks_conn)
+        for batch_start in range(0, len(col_infos), BATCH_SIZE):
+            batch = col_infos[batch_start : batch_start + BATCH_SIZE]
 
-        if syn_stats_raw.height > 0 and dbx_stats_raw.height > 0:
-            syn_row = syn_stats_raw.row(0, named=True)
-            dbx_row = dbx_stats_raw.row(0, named=True)
+            syn_sql = _build_synapse_stats_sql(batch, synapse_schema_name, synapse_table_name)
+            dbx_sql = _build_databricks_stats_sql(
+                batch, databricks_catalog_name, databricks_schema_name, databricks_table_name
+            )
 
-            syn_parsed = _parse_stats_row(syn_row, col_infos, "synapse")
-            dbx_parsed = _parse_stats_row(dbx_row, col_infos, "databricks")
+            syn_batch = pl.read_database(syn_sql, synapse_conn)
+            dbx_batch = pl.read_database(dbx_sql, databricks_conn)
+
+            if syn_batch.height > 0:
+                syn_row_merged.update(syn_batch.row(0, named=True))
+            if dbx_batch.height > 0:
+                dbx_row_merged.update(dbx_batch.row(0, named=True))
+
+        if syn_row_merged and dbx_row_merged:
+            syn_parsed = _parse_stats_row(syn_row_merged, col_infos, "synapse")
+            dbx_parsed = _parse_stats_row(dbx_row_merged, col_infos, "databricks")
 
             synapse_stats_df = pl.DataFrame(syn_parsed)
             databricks_stats_df = pl.DataFrame(dbx_parsed)
